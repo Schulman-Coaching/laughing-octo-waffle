@@ -57,7 +57,7 @@ jobs:
               }
             }
             backend "s3" {
-              bucket = "${{ inputs.project_name }}-terraform-state"
+              bucket = "github-actions-terraform-state-111238651930
               key    = "${{ inputs.environment }}/terraform.tfstate"
               region = "${{ inputs.aws_region }}"
             }
