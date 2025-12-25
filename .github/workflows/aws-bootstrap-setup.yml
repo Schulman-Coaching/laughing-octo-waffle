@@ -1,0 +1,179 @@
+name: AWS Bootstrap Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_account_id:
+        description: 'Your AWS Account ID'
+        required: true
+        type: string
+      github_org:
+        description: 'GitHub Organization name'
+        required: true
+        type: string
+      github_repo:
+        description: 'GitHub Repository name'
+        required: true
+        type: string
+      aws_region:
+        description: 'AWS Region'
+        required: true
+        type: string
+        default: 'us-east-1'
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: Bootstrap AWS Prerequisites
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+      
+      - name: Create OIDC Provider
+        run: |
+          echo "Creating OIDC Identity Provider..."
+          if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "arn:aws:iam::${{ inputs.aws_account_id }}:oidc-provider/token.actions.githubusercontent.com" 2>/dev/null; then
+            echo "OIDC provider already exists"
+          else
+            aws iam create-open-id-connect-provider \
+              --url https://token.actions.githubusercontent.com \
+              --client-id-list sts.amazonaws.com \
+              --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+            echo "OIDC provider created"
+          fi
+      
+      - name: Create IAM Role
+        run: |
+          echo "Creating IAM role..."
+          ROLE_NAME="GitHubActions-Infrastructure-Role"
+          
+          cat > trust-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "arn:aws:iam::${{ inputs.aws_account_id }}:oidc-provider/token.actions.githubusercontent.com"
+              },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                  "token.actions.githubusercontent.com:sub": "repo:${{ inputs.github_org }}/${{ inputs.github_repo }}:ref:refs/heads/main"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          if aws iam get-role --role-name "$ROLE_NAME" 2>/dev/null; then
+            echo "Role exists, updating trust policy"
+            aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document file://trust-policy.json
+          else
+            echo "Creating role"
+            aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json
+          fi
+          
+          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/AmazonVPCFullAccess || true
+          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess || true
+          
+          cat > s3-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": ["s3:*"],
+              "Resource": ["arn:aws:s3:::*-terraform-state", "arn:aws:s3:::*-terraform-state/*"]
+            }]
+          }
+          EOF
+          
+          POLICY_ARN="arn:aws:iam::${{ inputs.aws_account_id }}:policy/TerraformStateAccess"
+          if ! aws iam get-policy --policy-arn "$POLICY_ARN" 2>/dev/null; then
+            aws iam create-policy --policy-name TerraformStateAccess --policy-document file://s3-policy.json
+          fi
+          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || true
+          
+          echo "ROLE_ARN=arn:aws:iam::${{ inputs.aws_account_id }}:role/$ROLE_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Create S3 Template Bucket
+        run: |
+          echo "Creating S3 bucket for Terraform state..."
+          BUCKET_NAME="github-actions-terraform-state-${{ inputs.aws_account_id }}"
+          
+          if aws s3 ls "s3://$BUCKET_NAME" 2>/dev/null; then
+            echo "Bucket already exists"
+          else
+            if [ "${{ inputs.aws_region }}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET_NAME" --region "${{ inputs.aws_region }}"
+            else
+              aws s3api create-bucket --bucket "$BUCKET_NAME" --region "${{ inputs.aws_region }}" --create-bucket-configuration LocationConstraint="${{ inputs.aws_region }}"
+            fi
+          fi
+          
+          aws s3api put-bucket-versioning --bucket "$BUCKET_NAME" --versioning-configuration Status=Enabled
+          aws s3api put-bucket-encryption --bucket "$BUCKET_NAME" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+          aws s3api put-public-access-block --bucket "$BUCKET_NAME" --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+          
+          echo "S3 bucket configured: $BUCKET_NAME"
+      
+      - name: Display Instructions
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # AWS Bootstrap Complete! ✅
+          
+          ## Configuration Created
+          
+          ### IAM Role
+          - **Name**: GitHubActions-Infrastructure-Role
+          - **ARN**: `arn:aws:iam::${{ inputs.aws_account_id }}:role/GitHubActions-Infrastructure-Role`
+          
+          ### S3 State Bucket
+          - **Bucket**: `github-actions-terraform-state-${{ inputs.aws_account_id }}`
+          - **Features**: Versioning ✓, Encryption ✓, Public Access Blocked ✓
+          
+          ## IMPORTANT: Next Steps
+          
+          ### 1. Add GitHub Secret
+          Go to: **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+          
+          - **Name**: `AWS_ROLE_ARN`
+          - **Value**: `arn:aws:iam::${{ inputs.aws_account_id }}:role/GitHubActions-Infrastructure-Role`
+          
+          ### 2. Delete Temporary Secrets (Security!)
+          After adding AWS_ROLE_ARN, delete these temporary secrets:
+          - `AWS_ACCESS_KEY_ID`
+          - `AWS_SECRET_ACCESS_KEY`
+          
+          ### 3. Ready to Use!
+          You can now run the **AWS Infrastructure Setup** workflow for any project!
+          
+          ## Security Notes
+          - ✅ OIDC enabled - no long-lived credentials needed
+          - ✅ Role restricted to this repository only
+          - ✅ S3 buckets encrypted and secured
+          EOF
+          
+          echo "========================================"
+          echo "Bootstrap Complete!"
+          echo "========================================"
+          echo ""
+          echo "Add this GitHub secret:"
+          echo "  Name: AWS_ROLE_ARN"
+          echo "  Value: arn:aws:iam::${{ inputs.aws_account_id }}:role/GitHubActions-Infrastructure-Role"
+          echo ""
+          echo "Then DELETE temporary secrets:"
+          echo "  - AWS_ACCESS_KEY_ID"
+          echo "  - AWS_SECRET_ACCESS_KEY"
+          echo "========================================"
